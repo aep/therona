@@ -1,0 +1,590 @@
+using log;
+using esp32;
+using err;
+using vl53l1;
+using xchan;
+using carrier::esp32 as carrier;
+
+using "freertos.h"      as freertos;
+using <driver/i2c.h>    as i2c;
+using <esp_system.h>    as esp;
+using <nvs_flash.h>     as esp_nvs;
+using <esp_netif.h>     as esp_netif;
+using <esp_event.h>     as esp_event;
+
+using "provision.h"     as provision;
+
+inline using "button.h" as button;
+
+fn init_i2c(err::Err+et mut *e)
+    where err::checked(*e)
+{
+    if esp32::check_err(e, i2c::i2c_driver_install(i2c::I2C_NUM_0, i2c::I2C_MODE_MASTER, 0, 0, 0)) { return; }
+    i2c::i2c_config_t mut conf0 = unsafe<i2c::i2c_config_t>(i2c::i2c_config_t{
+        mode               : I2C_MODE_MASTER,
+        sda_io_num         : 16,
+        sda_pullup_en      : GPIO_PULLUP_ENABLE,
+        scl_io_num         : 17,
+        scl_pullup_en      : GPIO_PULLUP_ENABLE,
+    });
+    unsafe { conf0.master.clk_speed = 100000; };
+    if esp32::check_err(e, i2c::i2c_param_config(i2c::I2C_NUM_0, &conf0)) { return; }
+
+    if esp32::check_err(e, i2c::i2c_driver_install(i2c::I2C_NUM_1, i2c::I2C_MODE_MASTER, 0, 0, 0)) {return;}
+    i2c::i2c_config_t mut conf1 = unsafe<i2c::i2c_config_t>(i2c::i2c_config_t{
+        mode               : I2C_MODE_MASTER,
+        sda_io_num         : 32,
+        sda_pullup_en      : GPIO_PULLUP_ENABLE,
+        scl_io_num         : 33,
+        scl_pullup_en      : GPIO_PULLUP_ENABLE,
+    });
+    unsafe { conf1.master.clk_speed = 100000; };
+    if esp32::check_err(e, i2c::i2c_param_config(i2c::I2C_NUM_1, &conf1)) { return; }
+}
+
+
+
+
+using io;
+using carrier::endpoint;
+using carrier::cmd_common;
+using carrier::bootstrap;
+using net;
+using time;
+using carrier::publish;
+using carrier::config;
+using carrier::pub_sysinfo;
+using carrier::stream;
+using hpack;
+using string;
+using slice;
+
+fn carrier_main(void*_) {
+
+    log::info("REMAINING STACK at m1 %d", esp::uxTaskGetStackHighWaterMark(0));
+
+
+    err::Err+1000 mut*e = esp::malloc(sizeof(err::Err) + 1000);
+    err::assert_safe(e);
+    e->make();
+
+    new async  = io::select::make();
+
+    endpoint::Endpoint+30000 mut*ep = esp::malloc(sizeof(endpoint::Endpoint) + 30000);
+    err::assert_safe(ep);
+    ep->native(e);
+    e->abort();
+
+    cmd_common::print_identity(ep);
+
+    log::info("bootstrap");
+    bootstrap::sync(e, &(ep->vault), net::os(), &async, time::from_seconds(30));
+    e->abort();
+
+    ep->start(e, net::os(), &async);
+    e->abort();
+
+    io::await(&async, e, endpoint::poll, ep, time::from_seconds(30));
+    e->abort();
+
+    publish::publish(ep, e);
+    e->abort();
+
+    config::register(ep);
+    pub_sysinfo::register(ep);
+    carrier::register_reboot(ep);
+    carrier::register_ota(ep);
+    ep->register_stream(&SensorConfig);
+    ep->register_stream(&SensorDebugConfig);
+    ep->register_stream(&SensorSettings);
+
+    io::await(&async, e, endpoint::poll, ep, time::infinite());
+    e->abort();
+
+    esp::esp_restart();
+}
+
+
+using carrier::vault_esp32;
+using carrier::identity;
+
+static char * device_identity = 0;
+fn load_carrier_device_identity(err::Err+et mut *e)
+    where err::checked(*e)
+{
+    char *strstr = esp::malloc(100);
+    err::assert_safe(strstr);
+    static_attest(len(strstr) == 100);
+
+    new vault = vault_esp32::open(e);
+    e->abort();
+
+    identity::Identity mut id = {0};
+    vault.get_identity(&id);
+    identity::identity_to_str (e, strstr, 100, &id);
+    e->abort();
+
+    if vault.i_close.fn != 0 {
+        static_attest(safe(vault.i_close));
+        vault.i_close(&vault);
+    }
+
+    device_identity = strstr;
+}
+
+static stream::Config SensorSettings = stream::Config {
+    path:   "/v0/tof_settings",
+    open:   tof_settings_open,
+};
+
+fn tof_settings_open(stream::Stream mut* self, err::Err+et mut *e, slice::Slice * headers)
+    where err::checked(*e)
+{
+
+    new it = hpack::decoder::decode(headers);
+    while (it.next(e)) {
+        if err::check(e) { return; }
+        if it.key.eq_cstr("max_people") {
+            counter_max = unsafe<u32>(esp::atoi((char*)it.val.mem));
+
+            esp::nvs_handle_t mut handle = 0;
+            esp::ESP_ERROR_CHECK(esp::nvs_open("tof", esp::NVS_READWRITE , &handle));
+            esp::nvs_set_u32(handle, "max_people", counter_max);
+            esp::nvs_commit(handle);
+            esp::nvs_close(handle);
+        }
+    }
+
+    let frame = self->stream(e, 20);
+    if err::check(e) { return; }
+    hpack::encoder::encode(frame, e, (u8*)":status", 7, (u8*)"200", 3);
+    self->close();
+}
+
+
+static stream::Config SensorDebugConfig = stream::Config {
+    path:   "/v0/tof_debug",
+    open:   tof_debug_stream_open,
+    close:  tof_debug_stream_close,
+    poll:   tof_debug_stream_poll,
+};
+
+fn tof_debug_stream_open(stream::Stream mut* self, err::Err+et mut *e, slice::Slice * headers)
+    where err::checked(*e)
+{
+    let frame = self->stream(e, 20);
+    if err::check(e) { return; }
+    hpack::encoder::encode(frame, e, (u8*)":status", 7, (u8*)"200", 3);
+
+    frozen_sensor_loop = true;
+    light(true, true, true);
+}
+
+
+fn tof_debug_stream_close(stream::Stream mut* self, err::Err+et mut *e)
+    where err::checked(*e)
+{
+    frozen_sensor_loop = false;
+}
+
+
+
+static u64 mut last_poll = 0;
+fn tof_debug_stream_poll(stream::Stream mut*self, err::Err+et mut *e, io::Async mut*async)
+    where err::checked(*e)
+{
+    if !frozen_sensor_loop_ok {
+        return;
+    }
+
+    //TODO workaround for lack of pacing in carrier itself
+    static_attest(safe(self->chan));
+    let now = time::tick();
+    if last_poll + self->chan->q.rtt > now.to_millis() {
+        return;
+    }
+    last_poll  = now.to_millis();
+
+
+    let frame = self->stream(e, 100);
+    if err::check(e) { return; }
+
+    i16 mut range1  = 0;
+    u8  mut status1 = 0;
+    dev1.poll(e, &range1,  &status1);
+    if err::check(e) { return; }
+
+    i16 mut range2  = 0;
+    u8  mut status2 = 0;
+    dev2.poll(e, &range2, &status2);
+    if err::check(e) { return; }
+
+    char mut crossing_a = '-';
+    if dev1.currently_crossing {
+        crossing_a = 'x'
+    }
+    char mut crossing_b = '-';
+    if dev2.currently_crossing {
+        crossing_b = 'x'
+    }
+
+    new+100 s = string::make();
+    s.format("1: %c\ts: %d\tr: %d\tavg: %d\t2: %c\ts: %d\tr: %d\tavg: %d\n",
+        crossing_a, status1, range1, dev1.avg,
+        crossing_b, status2, range2, dev2.avg
+    );
+    frame->append_bytes((u8*)s.mem, s.len);
+
+}
+
+
+static stream::Config SensorConfig = stream::Config {
+    path:   "/v0/tof_events.json",
+    open:   tof_stream_open,
+    close:  tof_stream_close,
+    poll:   tof_stream_poll,
+};
+
+
+fn tof_stream_open(stream::Stream mut* self, err::Err+et mut *e, slice::Slice * headers)
+    where err::checked(*e)
+{
+    let frame = self->stream(e, 20);
+    if err::check(e) { return; }
+    hpack::encoder::encode(frame, e, (u8*)":status", 7, (u8*)"200", 3);
+
+
+    self->user2 = esp::calloc(1, sizeof(io::Io));
+
+}
+
+fn tof_stream_close(stream::Stream mut* self, err::Err+et mut *e)
+    where err::checked(*e)
+{
+    if self->user2 != 0 {
+        let wakeup = (io::Io mut *)self->user2;
+        static_attest(safe(wakeup));
+        wakeup->close();
+
+        esp::free(self->user2);
+        self->user2 = 0;
+    }
+}
+
+fn tof_stream_poll(stream::Stream mut*self, err::Err+et mut *e, io::Async mut*async)
+    where err::checked(*e)
+{
+    let wakeup = (io::Io mut *)self->user2;
+    static_attest(safe(wakeup));
+    if !wakeup->valid() {
+        *wakeup = xchan::chan("tof", async);
+    } else {
+        new+8 nothing = string::make();
+        if wakeup->read(e, &nothing) != io::Result::Ready {
+            return;
+        }
+    }
+    static_attest(err::checked(*e));
+
+    new+300 s = string::make();
+    s.append_cstr("{\"s\":\"");
+    switch state {
+        State::None => {
+            s.append_cstr("--");
+        }
+        State::LeftEnter => {
+            s.append_cstr(">-");
+        }
+        State::LeftBoth => {
+            s.append_cstr(">>");
+        }
+        State::LeftExit => {
+            s.append_cstr("->");
+        }
+        State::RightEnter => {
+            s.append_cstr("-<");
+        }
+        State::RightBoth => {
+            s.append_cstr("<<");
+        }
+        State::RightExit => {
+            s.append_cstr("<-");
+        }
+    }
+    s.format("\", \"count\": %u, \"max\": %u }\n", counter, counter_max);
+
+    static_attest(s.len < 100000);
+    let frame = self->stream(e, s.len);
+    if err::check(e) { return; }
+    frame->append_bytes((u8*)s.mem, s.len);
+}
+
+
+static bool mut frozen_sensor_loop      = false;
+static bool mut frozen_sensor_loop_ok   = false;
+
+static vl53l1::Sensor mut dev1 = {0};
+static vl53l1::Sensor mut dev2 = {0};
+
+export extern fn app_main() {
+    new+1000 e = err::make();
+
+    log::info("bootup\n");
+
+    button::gpio_setup();
+
+    unsafe {
+        esp::esp_err_t mut ee = unsafe<esp::esp_err_t>(esp::nvs_flash_init());
+        if unsafe<bool>(ee == esp::ESP_ERR_NVS_NO_FREE_PAGES) {
+            esp_nvs::nvs_flash_erase();
+            ee = unsafe<esp::esp_err_t>(esp::nvs_flash_init());
+        }
+        esp::ESP_ERROR_CHECK(ee);
+        esp::ESP_ERROR_CHECK(esp_netif::esp_netif_init());
+        esp::ESP_ERROR_CHECK(esp_event::esp_event_loop_create_default());
+        xchan::init();
+    }
+    setup_light();
+
+    log::info("cpu init okish");
+
+    load_carrier_device_identity(&e);
+    e.abort();
+
+    esp::printf("DEVICE IDENTITY: %s\n", device_identity);
+
+    provision::provision_connect(device_identity);
+
+    log::info("setup peripherals");
+
+    init_i2c(&e);
+    e.abort();
+
+    log::info("board guchi");
+
+
+    log::info("free heap: %u", unsafe<u32>(esp::esp_get_free_heap_size()));
+
+
+    unsafe {
+        freertos::TaskHandle_t mut xHandle = 0;
+        esp::xTaskCreate(carrier_main, "carrier", 20000, 0, 2, &xHandle);
+        esp::configASSERT(xHandle);
+    }
+
+    log::info("free heap: %u", unsafe<u32>(esp::esp_get_free_heap_size()));
+
+
+    esp::nvs_handle_t mut handle = 0;
+    esp::ESP_ERROR_CHECK(esp::nvs_open("tof", esp::NVS_READWRITE , &handle));
+    esp::nvs_get_u32(handle, "max_people", &counter_max);
+    esp::nvs_close(handle);
+
+    let mut wakeup = xchan::chan("tof", 0);
+
+    vl53l1::open(&dev1, &e, i2c::I2C_NUM_0,  0x29);
+    e.abort();
+
+    vl53l1::open(&dev2, &e, i2c::I2C_NUM_1, 0x29);
+    e.abort();
+
+    dev1.start_ranging(&e);
+    e.abort();
+
+    dev2.start_ranging(&e);
+    e.abort();
+
+    log::info("initialized\n");
+
+    // TODO add a shell command that pauses this loop and does a manual range
+    // so we can see the range status, which we are currently ignoring
+
+    for (;;) {
+        if frozen_sensor_loop {
+            frozen_sensor_loop_ok = true;
+            esp::sleep(1);
+            continue;
+        }
+        frozen_sensor_loop_ok = false;
+        i16 mut range = 0;
+        u8 mut status = 0;
+
+        let mut ev = dev1.poll(&e, &range, &status);
+        e.abort();
+        next(Zone::Left, ev);
+        if ev != vl53l1::Event::None {
+            wakeup.write_cstr(&e, "1");
+            e.abort();
+        }
+
+        ev = dev2.poll(&e, &range, &status);
+        e.abort();
+        next(Zone::Right, ev);
+        if ev != vl53l1::Event::None {
+            wakeup.write_cstr(&e, "2");
+            e.abort();
+        }
+
+
+
+    //printf("   %d\t%d\t%d\t%d\n", dev1.last, dev2.last, dev1.avg, dev2.avg);
+
+    //if dev1.currently_crossing && dev2.currently_crossing {
+    //    if !crossing {
+    //        crossing = true;
+    //        if dev1.start_crossing.more_than(&dev2.start_crossing) {
+    //            printf("\n\n\n\nPERSON IN <<<<<<<<\n\n\n\n");
+    //        } else {
+    //            printf("\n\n\n\nPERSON OUT >>>>>>>\n\n\n\n\n");
+    //        }
+    //    }
+    //} else {
+    //    crossing = false;
+    //}
+    }
+}
+
+
+enum Zone {
+    Left,
+    Right,
+}
+enum State {
+    None,
+
+    LeftEnter,
+    LeftBoth,
+    LeftExit,
+
+    RightEnter,
+    RightBoth,
+    RightExit,
+}
+
+
+
+static u32 mut counter     = 0;
+static u32 mut counter_max = 2;
+static State mut state = State::None;
+
+fn next(Zone zone, vl53l1::Event ev)
+{
+    switch ev {
+        vl53l1::Event::None => {
+        }
+        vl53l1::Event::Reset => {
+            state = State::None;
+        }
+        vl53l1::Event::Enter => {
+            switch state {
+                State::None => {
+                    if zone == Zone::Left {
+                        state = State::LeftEnter;
+                    } else if zone == Zone::Right {
+                        state = State::RightEnter;
+                    }
+                }
+                State::LeftEnter => {
+                    if zone == Zone::Right  {
+                        state = State::LeftBoth;
+                    }
+                }
+                State::RightEnter => {
+                    if zone == Zone::Left {
+                        state = State::RightBoth;
+                    }
+                }
+                State::LeftBoth => {}
+                State::RightBoth => {}
+                default => {
+                    state = State::None;
+                }
+            }
+        }
+        vl53l1::Event::Leave => {
+            switch state {
+                State::LeftBoth => {
+                    if zone == Zone::Left {
+                        state = State::LeftExit;
+                    } else if zone == Zone::Right {
+                        state = State::None;
+                    }
+                }
+                State::RightBoth => {
+                    if zone == Zone::Right {
+                        state = State::RightExit;
+                    } else if zone == Zone::Left {
+                        state = State::None;
+                    }
+                }
+                State::LeftExit => {
+                    if zone == Zone::Right {
+                        counter += 1;
+                        log::info("%u\n", counter);
+                    }
+                    state = State::None;
+                }
+                State::RightExit => {
+                    if zone == Zone::Left{
+                        if counter > 0 {
+                            counter -= 1;
+                        }
+                        log::info("%u\n", counter);
+                    }
+                    state = State::None;
+                }
+                default => {
+                    state = State::None;
+                }
+            }
+        }
+    }
+
+    switch state {
+        State::LeftEnter  ,
+        State::LeftBoth   ,
+        State::LeftExit   ,
+        State::RightEnter ,
+        State::RightBoth  ,
+        State::RightExit => {
+            light(false, true, false);
+        }
+        default => {
+            if counter >= counter_max {
+                light(true, false, false);
+            } else {
+                light(false, false, true);
+            }
+        }
+    }
+}
+
+using <driver/gpio.h> as gpio;
+
+
+const u8 LED_RED = 26;
+const u8 LED_YEL = 27;
+const u8 LED_GRN = 14;
+
+export fn light(bool red, bool yellow, bool green)
+{
+    gpio::gpio_set_level(LED_RED, !red);
+    gpio::gpio_set_level(LED_YEL, !yellow);
+    gpio::gpio_set_level(LED_GRN, !green);
+}
+
+
+export fn setup_light() {
+    gpio::gpio_pad_select_gpio(LED_RED);
+    gpio::gpio_pad_select_gpio(LED_YEL);
+    gpio::gpio_pad_select_gpio(LED_GRN);
+
+    gpio::gpio_set_direction(LED_RED, gpio::GPIO_MODE_OUTPUT);
+    gpio::gpio_set_direction(LED_YEL, gpio::GPIO_MODE_OUTPUT);
+    gpio::gpio_set_direction(LED_GRN, gpio::GPIO_MODE_OUTPUT);
+
+    gpio::gpio_set_level(LED_RED, 0);
+    gpio::gpio_set_level(LED_YEL, 0);
+    gpio::gpio_set_level(LED_GRN, 0);
+}
+

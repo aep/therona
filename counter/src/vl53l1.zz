@@ -1,0 +1,191 @@
+using <vl53l1_api.h> as vl53l1;
+using <driver/i2c.h> as i2c;
+using err;
+using time;
+using log;
+
+pub struct Sensor {
+    vl53l1::VL53L1_Dev_t dev;
+
+    usize       num;
+    bool        mut currently_crossing;
+    time::Time  mut last_crossing;
+    time::Time  mut start_crossing;
+    i16         mut avg;
+    i16         mut last;
+}
+
+pub fn open(Sensor new mut*self, err::Err+et mut *e, i2c::i2c_port_t bus, u8 address)
+    where err::checked(*e)
+{
+    unsafe {
+        self->dev.I2cDevAddr    = address;
+        self->dev.I2cHandle     = bus;
+        self->dev.comms_speed_khz = 100;
+
+        self->num = bus;
+    }
+
+    if vl53l1_check(e, vl53l1::VL53L1_software_reset(&self->dev))   { return; }
+    if vl53l1_check(e, vl53l1::VL53L1_DataInit(&self->dev))         { return; }
+    if vl53l1_check(e, vl53l1::VL53L1_StaticInit(&self->dev))       { return; }
+    if vl53l1_check(e, vl53l1::VL53L1_PerformRefSpadManagement(&self->dev))         { return; }
+    if vl53l1_check(e, vl53l1::VL53L1_SetXTalkCompensationEnable(&self->dev, 0))    { return; }
+    if vl53l1_check(e, vl53l1::VL53L1_SetMeasurementTimingBudgetMicroSeconds(&self->dev, 20000)) { return; }
+    if vl53l1_check(e, vl53l1::VL53L1_SetInterMeasurementPeriodMilliSeconds(&self->dev,  25))    { return; }
+    if vl53l1_check(e, vl53l1::VL53L1_SetDistanceMode(&self->dev, 2)) { return; }
+}
+
+export fn start_ranging(Sensor mut *self, err::Err+et mut* e)
+    where err::checked(*e)
+{
+    if vl53l1_check(e, vl53l1::VL53L1_StartMeasurement(&self->dev)) { return; }
+}
+
+
+pub fn sample(Sensor mut *self, err::Err+et mut* e, i16 mut * range,  u8 mut * status)
+    where err::checked(*e)
+{
+
+    if vl53l1_check(e,  vl53l1::VL53L1_WaitMeasurementDataReady(&self->dev)) { return ; }
+
+
+    vl53l1::VL53L1_RangingMeasurementData_t mut m = {0};
+    if vl53l1_check(e,  vl53l1::VL53L1_GetRangingMeasurementData(&self->dev, &m)) { return; }
+    if vl53l1_check(e,  vl53l1::VL53L1_ClearInterruptAndStartMeasurement(&self->dev)) { return ; }
+
+    unsafe {
+        *status = m.RangeStatus;
+        *range  = m.RangeMilliMeter;
+    }
+}
+
+pub enum Event {
+    None,
+    Enter,
+    Leave,
+    Reset
+}
+
+pub fn poll(Sensor mut*self,  err::Err+et mut* e, i16 mut * i_range,  u8 mut * i_status) -> Event
+    where err::checked(*e)
+{
+    self->sample(e, i_range, i_status);
+    i16 mut range  = *i_range;
+    u8  mut status = *i_status;
+
+    if err::check(e) {
+        return Event::Reset;
+    }
+    if status != 0 && status != 7  {
+        return Event::None;
+    }
+    if range < 1 {
+        return Event::None;
+    }
+
+    // above 2m we're just getting noise
+    if status == 7 || range > 2000 {
+        range = 2000;
+    }
+
+    let now = time::tick();
+    self->last = range;
+    if self->avg == 0 {
+        self->avg = range;
+    }
+
+    if self->currently_crossing {
+        if (self->avg /2) + 200 <= range {
+            self->currently_crossing = false;
+            log::info("%u leave %u\n", self->num, range);
+            return Event::Leave;
+        } else if now.to_seconds() > self->last_crossing.to_seconds() + 20  {
+            log::info("%u timeout \n", self->num);
+            self->last_crossing = now;
+            return Event::Reset;
+        } else {
+            self->last_crossing = now;
+        }
+    } else {
+        if (self->avg /2) + 200 > range {
+            self->currently_crossing = true;
+            if now.to_seconds() > self->last_crossing.to_seconds()  {
+                log::info("%u enter %u\n", self->num, range);
+                self->last_crossing = now;
+                self->start_crossing = now;
+            }
+            return Event::Enter;
+        } else {
+            self->avg = (self->avg + range) / 2;
+        }
+    }
+
+    return Event::None;
+}
+
+export symbol VL53L1Error;
+
+fn vl53l1_check(
+    err::Err+et mut* self,
+    vl53l1::VL53L1_Error c,
+    char* callsite_source<file>      unsafe file,
+    char* callsite_source<function>  unsafe scope,
+    usize callsite_source<line>      line,
+) -> bool
+    model return == true || err::checked(*self)
+{
+    switch c {
+        0 => {
+            static_attest(err::checked(*self));
+            return false;
+        }
+        -1  => {err::fail(self, VL53L1Error, "CalibrationWarning ");}
+        -2  => {err::fail(self, VL53L1Error, "MinClipped ");}
+        -3  => {err::fail(self, VL53L1Error, "Undefined ");}
+        -4  => {err::fail(self, VL53L1Error, "InvalidParams ");}
+        -5  => {err::fail(self, VL53L1Error, "NotSupported ");}
+        -6  => {err::fail(self, VL53L1Error, "RangeError ");}
+        -7  => {err::fail(self, VL53L1Error, "TimeOut ");}
+        -8  => {err::fail(self, VL53L1Error, "ModeNotSupported ");}
+        -9  => {err::fail(self, VL53L1Error, "BufferTooSmall ");}
+        -10 => {err::fail(self, VL53L1Error, "CommsBufferTooSmall ");}
+        -11 => {err::fail(self, VL53L1Error, "GpioNotExisting ");}
+        -12 => {err::fail(self, VL53L1Error, "GpioFunctionalityNotSupported ");}
+        -13 => {err::fail(self, VL53L1Error, "ControlInterface ");}
+        -14 => {err::fail(self, VL53L1Error, "InvalidCommand ");}
+        -15 => {err::fail(self, VL53L1Error, "DivisionByZero ");}
+        -16 => {err::fail(self, VL53L1Error, "RefSpadInit ");}
+        -17 => {err::fail(self, VL53L1Error, "GphSyncCheckFail ");}
+        -18 => {err::fail(self, VL53L1Error, "StreamCountCheckFail ");}
+        -19 => {err::fail(self, VL53L1Error, "GphIdCheckFail ");}
+        -20 => {err::fail(self, VL53L1Error, "ZoneStreamCountCheckFail ");}
+        -21 => {err::fail(self, VL53L1Error, "ZoneGphIdCheckFail ");}
+        -22 => {err::fail(self, VL53L1Error, "XtalkExtractionNoSampleFail ");}
+        -23 => {err::fail(self, VL53L1Error, "XtalkExtractionSigmaLimitFail ");}
+        -24 => {err::fail(self, VL53L1Error, "OffsetCalNoSampleFail ");}
+        -25 => {err::fail(self, VL53L1Error, "OffsetCalNoSpadsEnabledFail ");}
+        -26 => {err::fail(self, VL53L1Error, "ZoneCalNoSampleFail ");}
+        -27 => {err::fail(self, VL53L1Error, "TuningParmKeyMismatch ");}
+        -28 => {err::fail(self, VL53L1Error, "WarningRefSpadCharNotEnoughSpads ");}
+        -29 => {err::fail(self, VL53L1Error, "WarningRefSpadCharRateTooHigh ");}
+        -30 => {err::fail(self, VL53L1Error, "WarningRefSpadCharRateTooLow ");}
+        -31 => {err::fail(self, VL53L1Error, "WarningOffsetCalMissingSamples ");}
+        -32 => {err::fail(self, VL53L1Error, "WarningOffsetCalSigmaTooHigh ");}
+        -33 => {err::fail(self, VL53L1Error, "WarningOffsetCalRateTooHigh ");}
+        -34 => {err::fail(self, VL53L1Error, "WarningOffsetCalSpadCountTooLow ");}
+        -35 => {err::fail(self, VL53L1Error, "WarningZoneCalMissingSamples ");}
+        -36 => {err::fail(self, VL53L1Error, "WarningZoneCalSigmaTooHigh ");}
+        -37 => {err::fail(self, VL53L1Error, "WarningZoneCalRateTooHigh ");}
+        -38 => {err::fail(self, VL53L1Error, "WarningXtalkMissingSamples ");}
+        -39 => {err::fail(self, VL53L1Error, "WarningXtalkNoSamplesForGradient ");}
+        -40 => {err::fail(self, VL53L1Error, "WarningXtalkSigmaLimitForGradient ");}
+        -41 => {err::fail(self, VL53L1Error, "NotImplemented ");}
+        -60 => {err::fail(self, VL53L1Error, "PlatformSpecificStart ");}
+        default => {err::fail(self, VL53L1Error, "UnKnown Error %d", c);}
+    }
+
+    err::backtrace(self, file, scope, line);
+    return true;
+
+}
